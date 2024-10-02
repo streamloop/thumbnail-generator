@@ -1,8 +1,8 @@
-#:schema node_modules/wrangler/config-schema.json
+# :schema node_modules/wrangler/config-schema.json
 name = "thumbnail-generator"
 main = "src/index.ts"
 compatibility_date = "2024-09-25"
-compatibility_flags = ["nodejs_compat"]
+compatibility_flags = [ "nodejs_compat" ]
 
 # Workers Logs
 # Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
@@ -37,8 +37,8 @@ enabled = true
 
 # Bind a headless browser instance running on Cloudflare's global network.
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#browser-rendering
-# [browser]
-# binding = "MY_BROWSER"
+[browser]
+binding = "MY_BROWSER"
 
 # Bind a D1 database. D1 is Cloudflare’s native serverless SQL database.
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#d1-databases
