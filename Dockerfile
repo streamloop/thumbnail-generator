@@ -18,9 +18,7 @@ RUN bun build --minify --target bun --outfile=server.js src/server.ts
 FROM base AS release
 COPY --from=install /temp/dev/server.js .
 
-RUN bunx @puppeteer/browsers install chrome@stable --path /home/bun/.cache/puppeteer
-
-USER bun
+RUN bunx @puppeteer/browsers install chrome@stable
 
 EXPOSE 3000/tcp
 ENTRYPOINT ["bun", "server.js"]
