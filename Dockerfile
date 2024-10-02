@@ -2,7 +2,6 @@
 # see all versions at https://hub.docker.com/r/oven/bun/tags
 FROM oven/bun:1 AS base
 WORKDIR /usr/src/app
-RUN bunx @puppeteer/browsers install chrome@stable
 
 # install dependencies into temp directory
 # this will cache them and speed up future builds
@@ -20,5 +19,7 @@ FROM base AS release
 COPY --from=install /temp/dev/server.js .
 
 USER bun
+RUN bunx @puppeteer/browsers install chrome@stable
+
 EXPOSE 3000/tcp
 ENTRYPOINT ["bun", "server.js"]
