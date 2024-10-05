@@ -19,8 +19,6 @@ async function launchBrowser() {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage', // Use temporary disk storage instead of shared memory
-      '--disable-gpu', // Disable GPU acceleration (if not needed)
-      '--disable-software-rasterizer', // Disable software rendering
     ],
   })
 
@@ -88,7 +86,7 @@ app.get('/generate-thumbnail', async (c) => {
     const signedUrl = await getSignedUrlForVideo(videoKey)
 
     // Add the task to the queue
-    const result = await queue.add<{ success: boolean; data?: any; error?: string }>(async () => {
+    const result = await queue.add<{ success: boolean, data?: any, error?: string }>(async () => {
       // Create a new page in the existing browser
       const page = await browser.newPage()
 
@@ -137,7 +135,8 @@ app.get('/generate-thumbnail', async (c) => {
                         sHeight = videoWidth / canvasAspectRatio
                         sx = 0
                         sy = (videoHeight - sHeight) / 2
-                      } else {
+                      }
+                      else {
                         // Canvas is taller than video
                         sWidth = videoHeight * canvasAspectRatio
                         sHeight = videoHeight
@@ -156,7 +155,8 @@ app.get('/generate-thumbnail', async (c) => {
                         width,
                         height,
                       )
-                    } else if (fit === 'clip') {
+                    }
+                    else if (fit === 'clip') {
                       // Fit the entire video frame into the canvas, maintaining aspect ratio
                       const videoAspectRatio = videoWidth / videoHeight
                       const canvasAspectRatio = width / height
@@ -169,7 +169,8 @@ app.get('/generate-thumbnail', async (c) => {
                         dWidth = height * videoAspectRatio
                         dx = (width - dWidth) / 2
                         dy = 0
-                      } else {
+                      }
+                      else {
                         // Canvas is taller than video
                         dWidth = width
                         dHeight = width / videoAspectRatio
@@ -188,7 +189,8 @@ app.get('/generate-thumbnail', async (c) => {
                         dWidth,
                         dHeight,
                       )
-                    } else if (fit === 'scale') {
+                    }
+                    else if (fit === 'scale') {
                       // Stretch the video to fill the canvas
                       ctx.drawImage(
                         video,
@@ -201,7 +203,8 @@ app.get('/generate-thumbnail', async (c) => {
                         width,
                         height,
                       )
-                    } else if (fit === 'fill') {
+                    }
+                    else if (fit === 'fill') {
                       // Fill the canvas with black background
                       ctx.fillStyle = 'black'
                       ctx.fillRect(0, 0, width, height)
@@ -218,7 +221,8 @@ app.get('/generate-thumbnail', async (c) => {
                         dWidth = height * videoAspectRatio
                         dx = (width - dWidth) / 2
                         dy = 0
-                      } else {
+                      }
+                      else {
                         // Canvas is taller than video
                         dWidth = width
                         dHeight = width / videoAspectRatio
@@ -237,7 +241,8 @@ app.get('/generate-thumbnail', async (c) => {
                         dWidth,
                         dHeight,
                       )
-                    } else {
+                    }
+                    else {
                       reject('Invalid fit parameter')
                       return
                     }
@@ -253,14 +258,16 @@ app.get('/generate-thumbnail', async (c) => {
                             resolve(Array.from(uint8Array))
                           }
                           reader.readAsArrayBuffer(blob)
-                        } else {
+                        }
+                        else {
                           reject('Failed to create blob from canvas')
                         }
                       },
                       'image/jpeg',
                       0.8, // Quality parameter (optional)
                     )
-                  } else {
+                  }
+                  else {
                     reject('Canvas context is not available')
                   }
                 }
@@ -291,13 +298,15 @@ app.get('/generate-thumbnail', async (c) => {
             data: imgBuffer,
           }
         }
-      } catch (error: any) {
+      }
+      catch (error: any) {
         console.error(error)
         return {
           success: false,
           error: `Error processing video: ${error.message}`,
         }
-      } finally {
+      }
+      finally {
         await page.close()
       }
 
@@ -313,10 +322,12 @@ app.get('/generate-thumbnail', async (c) => {
       return c.body(result.data, 200, {
         ...sharedHeaders,
       })
-    } else {
+    }
+    else {
       return c.text(result?.error || 'Failed to generate thumbnail', 500)
     }
-  } catch (error: any) {
+  }
+  catch (error: any) {
     console.error(error)
     return c.text(`Error processing request: ${error.message}`, 500)
   }
