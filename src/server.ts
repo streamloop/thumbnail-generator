@@ -16,9 +16,17 @@ async function launchBrowser() {
   browser = await puppeteer.launch({
     headless: true,
     args: [
+      '--enable-gpu',
       '--no-sandbox',
+      '--use-gl=angle',
+      '--use-angle=gl-egl',
+      '--disable-dev-shm-usage',
       '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage', // Use temporary disk storage instead of shared memory
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins',
+      '--disable-site-isolation-trials',
+      '--use-gl=angle',
+      '--use-angle=gl-egl',
     ],
   })
 
@@ -48,7 +56,7 @@ app.get('/generate-thumbnail', async (c) => {
   const widthStr = c.req.query('width') || '1280'
   const fit = c.req.query('fit') || 'crop'
 
-  const cacheKey = `${videoKey}-${timeStr}-${heightStr}-${widthStr}-${fit}`
+  const cacheKey = `v2-${videoKey}-${timeStr}-${heightStr}-${widthStr}-${fit}`
   const cachedThumbnail = await getCachedThumbnail(cacheKey)
   if (cachedThumbnail) {
     console.log('returning cached thumbnail', cacheKey)
