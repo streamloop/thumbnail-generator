@@ -1,36 +1,44 @@
-import { spawn } from 'bun'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { type Serve, spawn } from 'bun'
 import { Hono } from 'hono'
 import ms from 'ms'
 import PQueue from 'p-queue'
-import { getCachedThumbnail, getSignedUrlForVideo, uploadThumbnail } from './r2' // Import spawn from Bun
+import { getCachedThumbnail, getSignedUrlForVideo, uploadThumbnail } from './r2'
 
 const app = new Hono()
-const sharedHeaders = {
-  'content-type': 'image/jpeg',
-  'cache-control': 'public, max-age=31536000',
-}
+// Default cache-control header remains the same
+const CACHE_CONTROL = 'public, max-age=31536000'
 
 // Create a PQueue instance with a concurrency limit
 const queue = new PQueue({ concurrency: 5 }) // Adjust concurrency as needed
 
 app.get('/generate-thumbnail', async (c) => {
   const videoKey = c.req.query('key')
-
   if (!videoKey) {
     return c.text('Please add a ?key=videos/video.mp4 parameter', 400)
   }
+
+  const acceptHeader = c.req.header('accept') || ''
+  const supportsAvif = acceptHeader.includes('image/avif')
+  const contentType = supportsAvif
+    ? 'image/avif'
+    : 'image/jpeg'
+  const outputMimeType = contentType
 
   const timeStr = c.req.query('time') || '0s'
   const heightStr = c.req.query('height') || '720'
   const widthStr = c.req.query('width') || '1280'
   const fit = c.req.query('fit') || 'crop'
+  const cacheKey = `${videoKey}-${timeStr}-${heightStr}-${widthStr}-${fit}-${supportsAvif ? 'avif' : 'jpeg'}`
 
-  const cacheKey = `${videoKey}-${timeStr}-${heightStr}-${widthStr}-${fit}`
   const cachedThumbnail = await getCachedThumbnail(cacheKey)
   if (cachedThumbnail) {
     console.log('Returning cached thumbnail:', cacheKey)
     return c.body(cachedThumbnail, 200, {
-      ...sharedHeaders,
+      'content-type': contentType,
+      'cache-control': CACHE_CONTROL,
     })
   }
 
@@ -62,7 +70,7 @@ app.get('/generate-thumbnail', async (c) => {
   try {
     const signedUrl = await getSignedUrlForVideo(videoKey)
 
-    // Add the task to the queue
+    // Add the thumbnail generation task to the queue
     const result = await queue.add(async () => {
       try {
         // Build ffmpeg arguments
@@ -70,26 +78,20 @@ app.get('/generate-thumbnail', async (c) => {
 
         // Seek to the specified time
         ffmpegArgs.push('-ss', `${timeSec}`)
-
         // Input URL
         ffmpegArgs.push('-i', signedUrl)
-
         // Only process one frame
         ffmpegArgs.push('-frames:v', '1')
 
-        // Handle fit parameter
+        // Build filter based on 'fit'
         let filter = ''
-
         if (fit === 'crop') {
-          // Center crop
           filter = `crop=${width}:${height}:(in_w-${width})/2:(in_h-${height})/2`
         }
         else if (fit === 'clip' || fit === 'fill') {
-          // Scale to fit within dimensions (maintaining aspect ratio), pad if necessary
           filter = `scale='iw*min(${width}/iw\\,${height}/ih)':'ih*min(${width}/iw\\,${height}/ih)',pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`
         }
         else if (fit === 'scale') {
-          // Stretch to fit the dimensions
           filter = `scale=${width}:${height}`
         }
         else {
@@ -98,72 +100,116 @@ app.get('/generate-thumbnail', async (c) => {
             error: 'Invalid fit parameter',
           }
         }
-
         if (filter) {
           ffmpegArgs.push('-filter:v', filter)
         }
 
-        // Output format to stdout as JPEG
-        ffmpegArgs.push('-f', 'image2pipe')
-        ffmpegArgs.push('-vcodec', 'mjpeg')
-        ffmpegArgs.push('-')
+        if (supportsAvif) {
+          // For AVIF: output to a temporary file (the avif muxer requires a seekable output)
+          const tmpFilePath = path.join(os.tmpdir(), `thumbnail-${Date.now()}-${Math.random().toString(36).slice(2)}.avif`)
+          ffmpegArgs.push('-c:v', 'libaom-av1')
+          ffmpegArgs.push('-crf', '30')
+          ffmpegArgs.push('-preset', 'fast')
+          ffmpegArgs.push('-pix_fmt', 'yuv420p')
+          ffmpegArgs.push('-f', 'avif')
+          // Output to the temporary file
+          ffmpegArgs.push(tmpFilePath)
 
-        console.log('Running ffmpeg with args:', ffmpegArgs)
+          console.log('Running ffmpeg with args:', ffmpegArgs)
+          const ffmpegProcess = spawn({
+            cmd: ['ffmpeg', ...ffmpegArgs],
+            stdout: 'inherit',
+            stderr: 'pipe',
+          })
 
-        // Run ffmpeg process
-        const ffmpegProcess = spawn({
-          cmd: ['ffmpeg', ...ffmpegArgs],
-          stdout: 'pipe',
-          stderr: 'pipe',
-        })
-
-        // Collect stdout and stderr
-        const stdoutChunks: Uint8Array[] = []
-        const stderrChunks: Uint8Array[] = []
-
-        const stdoutPromise = (async () => {
-          for await (const chunk of ffmpegProcess.stdout) {
-            stdoutChunks.push(chunk)
-          }
-        })()
-
-        const stderrPromise = (async () => {
+          const stderrChunks = []
           for await (const chunk of ffmpegProcess.stderr) {
             stderrChunks.push(chunk)
           }
-        })()
+          const exitCode = await ffmpegProcess.exited
 
-        await Promise.all([stdoutPromise, stderrPromise])
-
-        const exitCode = await ffmpegProcess.exited
-
-        if (exitCode !== 0) {
-          const stderrOutput = Buffer.concat(stderrChunks).toString()
-          console.error('ffmpeg error:', stderrOutput)
-          return {
-            success: false,
-            error: `ffmpeg exited with code ${exitCode}: ${stderrOutput}`,
+          if (exitCode !== 0) {
+            const stderrOutput = Buffer.concat(stderrChunks).toString()
+            console.error('ffmpeg error:', stderrOutput)
+            return {
+              success: false,
+              error: `ffmpeg exited with code ${exitCode}: ${stderrOutput}`,
+            }
           }
-        }
 
-        // Combine stdout chunks into a single Buffer
-        const imgBuffer = Buffer.concat(stdoutChunks)
-
-        // Check if imgBuffer has data
-        if (imgBuffer.length > 0) {
-          return {
-            success: true,
-            data: imgBuffer,
+          // Read the generated file and then clean it up
+          const imgBuffer = await fs.promises.readFile(tmpFilePath)
+          await fs.promises.unlink(tmpFilePath)
+          if (imgBuffer.length > 0) {
+            return {
+              success: true,
+              data: imgBuffer,
+            }
+          }
+          else {
+            return {
+              success: false,
+              error: 'No data received from ffmpeg',
+            }
           }
         }
         else {
-          return {
-            success: false,
-            error: 'No data received from ffmpeg',
+          // For JPEG: output using mjpeg to stdout
+          ffmpegArgs.push('-f', 'image2pipe')
+          ffmpegArgs.push('-q:v', '3')
+          ffmpegArgs.push('-vcodec', 'mjpeg')
+          ffmpegArgs.push('-')
+
+          console.log('Running ffmpeg with args:', ffmpegArgs)
+          const ffmpegProcess = spawn({
+            cmd: ['ffmpeg', ...ffmpegArgs],
+            stdout: 'pipe',
+            stderr: 'pipe',
+          })
+
+          const stdoutChunks = []
+          const stderrChunks = []
+
+          const stdoutPromise = (async () => {
+            for await (const chunk of ffmpegProcess.stdout) {
+              stdoutChunks.push(chunk)
+            }
+          })()
+
+          const stderrPromise = (async () => {
+            for await (const chunk of ffmpegProcess.stderr) {
+              stderrChunks.push(chunk)
+            }
+          })()
+
+          await Promise.all([stdoutPromise, stderrPromise])
+          const exitCode = await ffmpegProcess.exited
+
+          if (exitCode !== 0) {
+            const stderrOutput = Buffer.concat(stderrChunks).toString()
+            console.error('ffmpeg error:', stderrOutput)
+            return {
+              success: false,
+              error: `ffmpeg exited with code ${exitCode}: ${stderrOutput}`,
+            }
+          }
+
+          const imgBuffer = Buffer.concat(stdoutChunks)
+          if (imgBuffer.length > 0) {
+            return {
+              success: true,
+              data: imgBuffer,
+            }
+          }
+          else {
+            return {
+              success: false,
+              error: 'No data received from ffmpeg',
+            }
           }
         }
       }
-      catch (error: any) {
+      catch (error) {
         console.error(error)
         return {
           success: false,
@@ -172,18 +218,19 @@ app.get('/generate-thumbnail', async (c) => {
       }
     })
 
-    // Handle the result
     if (result?.success) {
       await uploadThumbnail(cacheKey, result.data)
       return c.body(result.data, 200, {
-        ...sharedHeaders,
+        'content-type': outputMimeType,
+        'cache-control': CACHE_CONTROL,
+        'Vary': 'Accept',
       })
     }
     else {
       return c.text(result?.error || 'Failed to generate thumbnail', 500)
     }
   }
-  catch (error: any) {
+  catch (error) {
     console.error(error)
     return c.text(`Error processing request: ${error.message}`, 500)
   }
@@ -192,4 +239,6 @@ app.get('/generate-thumbnail', async (c) => {
 export default {
   port: Number(process.env.PORT) || 3000,
   fetch: app.fetch,
-}
+  // 30s
+  idleTimeout: 30,
+} satisfies Serve
