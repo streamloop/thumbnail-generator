@@ -31,7 +31,7 @@ app.get('/generate-thumbnail', async (c) => {
   const heightStr = c.req.query('height') || '720'
   const widthStr = c.req.query('width') || '1280'
   const fit = c.req.query('fit') || 'crop'
-  const cacheKey = `${videoKey}-${timeStr}-${heightStr}-${widthStr}-${fit}-${supportsAvif ? 'avif' : 'jpeg'}`
+  const cacheKey = `v2-${videoKey}-${timeStr}-${heightStr}-${widthStr}-${fit}-${supportsAvif ? 'avif' : 'jpeg'}`
 
   const cachedThumbnail = await getCachedThumbnail(cacheKey)
   if (cachedThumbnail) {
@@ -86,12 +86,17 @@ app.get('/generate-thumbnail', async (c) => {
         // Build filter based on 'fit'
         let filter = ''
         if (fit === 'crop') {
-          filter = `crop=${width}:${height}:(in_w-${width})/2:(in_h-${height})/2`
+          // Use aspect ratio-aware cropping similar to browser implementation
+          filter = `scale=iw*min(${width}/iw\\,${height}/ih):ih*min(${width}/iw\\,${height}/ih),crop=${width}:${height}`
         }
         else if (fit === 'clip' || fit === 'fill') {
-          filter = `scale='iw*min(${width}/iw\\,${height}/ih)':'ih*min(${width}/iw\\,${height}/ih)',pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`
+          // Preserve aspect ratio & center in frame (clip/letterbox)
+          // This first scales the video to fit within the dimensions while preserving aspect ratio
+          // Then pads with empty space if needed to reach exact dimensions
+          filter = `scale='min(${width},iw*${height}/ih)':'min(${height},ih*${width}/iw)',pad=${width}:${height}:(${width}-iw)/2:(${height}-ih)/2`
         }
         else if (fit === 'scale') {
+          // Scale with forced dimensions (may distort)
           filter = `scale=${width}:${height}`
         }
         else {
