@@ -1,13 +1,15 @@
+import { Buffer } from 'node:buffer'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { type Serve, spawn } from 'bun'
+import process from 'node:process'
+import { readableStreamToArrayBuffer, type Serve, spawn } from 'bun'
 import { Hono } from 'hono'
 import ms from 'ms'
 import PQueue from 'p-queue'
 import { getCachedThumbnail, getSignedUrlForVideo, uploadThumbnail } from './r2'
 
-const app = new Hono()
+export const app = new Hono()
 // Default cache-control header remains the same
 const CACHE_CONTROL = 'public, max-age=31536000'
 
@@ -16,6 +18,7 @@ const queue = new PQueue({ concurrency: 5 }) // Adjust concurrency as needed
 
 app.get('/generate-thumbnail', async (c) => {
   const videoKey = c.req.query('key')
+  const noCache = Boolean(c.req.query('noCache'))
   if (!videoKey) {
     return c.text('Please add a ?key=videos/video.mp4 parameter', 400)
   }
@@ -30,23 +33,58 @@ app.get('/generate-thumbnail', async (c) => {
   const timeStr = c.req.query('time') || '0s'
   const heightStr = c.req.query('height') || '720'
   const widthStr = c.req.query('width') || '1280'
-  const fit = c.req.query('fit') || 'crop'
-  const cacheKey = `v2-${videoKey}-${timeStr}-${heightStr}-${widthStr}-${fit}-${supportsAvif ? 'avif' : 'jpeg'}`
+  const fit = c.req.query('fit') || 'cover'
+  const cacheKey = `v3-${videoKey}-${timeStr}-${heightStr}-${widthStr}-${fit}-${supportsAvif ? 'avif' : 'jpeg'}`
+  const etag = `"${cacheKey}"` // Generate ETag from cacheKey (wrap in quotes)
 
-  const cachedThumbnail = await getCachedThumbnail(cacheKey)
-  if (cachedThumbnail) {
-    console.log('Returning cached thumbnail:', cacheKey)
-    return c.body(cachedThumbnail, 200, {
+  // --- ETag Check --- (Do this before checking R2 cache)
+  const ifNoneMatch = c.req.header('if-none-match')
+  if (!noCache && ifNoneMatch && ifNoneMatch === etag) {
+    // Client has the latest version, and we are not forcing a refresh
+    return c.body(null, 304)
+  }
+
+  // --- R2 Cache Check --- (Only if not 304 and caching enabled)
+  let cachedData: Buffer | null = null
+  if (!noCache) {
+    const cacheResult = await getCachedThumbnail(cacheKey)
+    if (cacheResult) {
+      if (cacheResult instanceof Buffer) {
+        cachedData = cacheResult
+      }
+      else if (typeof (cacheResult as any).getReader === 'function') {
+        console.log('Cached thumbnail is a stream, converting to Buffer...')
+        try {
+          const buffer = await readableStreamToArrayBuffer(cacheResult as ReadableStream)
+          cachedData = Buffer.from(buffer)
+        }
+        catch (streamError) {
+          console.error('Error reading cached stream:', streamError)
+        }
+      }
+      else {
+        console.warn('Unrecognized cache result type:', typeof cacheResult)
+      }
+    }
+  }
+
+  // Use cachedData Buffer
+  if (cachedData) {
+    console.log('Returning cached thumbnail from R2:', cacheKey)
+    // Return 200 OK with data and ETag
+    return c.body(cachedData.buffer as ArrayBuffer, 200, {
       'content-type': contentType,
       'cache-control': CACHE_CONTROL,
+      'ETag': etag, // Add ETag header
     })
   }
 
+  // --- Thumbnail Generation --- (Only if not 304 and cache miss)
   console.log('Generating thumbnail:', cacheKey)
 
   // Parse time using 'ms' package
   const timeMs = ms(timeStr)
-  if (typeof timeMs !== 'number' || isNaN(timeMs)) {
+  if (typeof timeMs !== 'number' || Number.isNaN(timeMs)) {
     return c.text('Invalid time parameter', 400)
   }
   const timeSec = timeMs / 1000
@@ -54,12 +92,13 @@ app.get('/generate-thumbnail', async (c) => {
   // Parse height and width
   const height = Number.parseInt(heightStr, 10)
   const width = Number.parseInt(widthStr, 10)
-  if (isNaN(height) || isNaN(width) || height <= 0 || width <= 0) {
+  if (Number.isNaN(height) || Number.isNaN(width) || height <= 0 || width <= 0) {
     return c.text('Invalid height or width parameter', 400)
   }
 
   // Validate 'fit' parameter
-  const validFits = ['crop', 'clip', 'scale', 'fill']
+  // See: https://developers.cloudflare.com/images/image-resizing/url-format/#fit
+  const validFits = ['contain', 'cover', 'crop', 'scale-down', 'pad', 'scale']
   if (!validFits.includes(fit)) {
     return c.text(
       `Invalid fit parameter. Must be one of: ${validFits.join(', ')}`,
@@ -72,6 +111,7 @@ app.get('/generate-thumbnail', async (c) => {
 
     // Add the thumbnail generation task to the queue
     const result = await queue.add(async () => {
+      let tmpFilePath: string | null = null
       try {
         // Build ffmpeg arguments
         const ffmpegArgs = []
@@ -85,35 +125,38 @@ app.get('/generate-thumbnail', async (c) => {
 
         // Build filter based on 'fit'
         let filter = ''
-        if (fit === 'crop') {
-          // Use aspect ratio-aware cropping similar to browser implementation
-          // Scale the video so that it covers the target dimensions while preserving aspect ratio
-          // Crop the center of the scaled video to the target dimensions
-          filter = `scale='max(iw*${height}/ih\\, ${width})':'max(ih*${width}/iw\\, ${height})',crop=${width}:${height}`
+        if (fit === 'cover') {
+          // Scale down/up to fill bounds, preserve aspect ratio, crop excess. (Like object-fit: cover)
+          filter = `scale='max(iw*${height}/ih, ${width})':'max(ih*${width}/iw, ${height})',crop=${width}:${height}`
         }
-        else if (fit === 'clip' || fit === 'fill') {
-          // Preserve aspect ratio & center in frame (clip/letterbox)
-          // This first scales the video to fit within the dimensions while preserving aspect ratio
-          // Then pads with empty space if needed to reach exact dimensions
-          filter = `scale='min(${width},iw*${height}/ih)':'min(${height},ih*${width}/iw)',pad=${width}:${height}:(${width}-iw)/2:(${height}-ih)/2`
+        else if (fit === 'contain' || fit === 'pad') {
+          // Scale down/up to fit within bounds, preserve aspect ratio, pad if needed. (Like object-fit: contain)
+          // Pad uses -1 for centered coordinates and black background by default
+          filter = `scale='min(${width},iw*${height}/ih)':'min(${height},ih*${width}/iw)',pad=${width}:${height}:-1:-1:color=black`
+        }
+        else if (fit === 'crop') {
+          // Scale down (never up) to cover area, preserve aspect ratio, crop excess.
+          // Output is at most target dimensions. No padding.
+          filter = `scale='min(iw, max(iw*${height}/ih, ${width}))':'min(ih, max(ih*${width}/iw, ${height}))',crop='min(iw,${width})':'min(ih,${height})'`
+        }
+        else if (fit === 'scale-down') {
+          // Scale down only if larger than bounds, preserve aspect ratio, pad if needed.
+          // Pad uses -1 for centered coordinates and black background by default
+          filter = `scale='min(iw,${width})':'min(ih,${height})':force_original_aspect_ratio=decrease,pad=${width}:${height}:-1:-1:color=black`
         }
         else if (fit === 'scale') {
-          // Scale with forced dimensions (may distort)
+          // Force scale to exact dimensions, ignore aspect ratio. (Like object-fit: fill)
           filter = `scale=${width}:${height}`
         }
-        else {
-          return {
-            success: false,
-            error: 'Invalid fit parameter',
-          }
-        }
+        // No 'else' needed due to validFits check above
+
         if (filter) {
           ffmpegArgs.push('-filter:v', filter)
         }
 
         if (supportsAvif) {
           // For AVIF: output to a temporary file (the avif muxer requires a seekable output)
-          const tmpFilePath = path.join(os.tmpdir(), `thumbnail-${Date.now()}-${Math.random().toString(36).slice(2)}.avif`)
+          tmpFilePath = path.join(os.tmpdir(), `thumbnail-${Date.now()}-${Math.random().toString(36).slice(2)}.avif`)
           ffmpegArgs.push('-c:v', 'libaom-av1')
           ffmpegArgs.push('-crf', '30')
           ffmpegArgs.push('-preset', 'fast')
@@ -125,83 +168,74 @@ app.get('/generate-thumbnail', async (c) => {
           console.log('Running ffmpeg with args:', ffmpegArgs)
           const ffmpegProcess = spawn({
             cmd: ['ffmpeg', ...ffmpegArgs],
-            stdout: 'inherit',
+            stdout: 'ignore',
             stderr: 'pipe',
           })
 
-          const stderrChunks = []
-          for await (const chunk of ffmpegProcess.stderr) {
-            stderrChunks.push(chunk)
-          }
+          const stderrBuffer = await readableStreamToArrayBuffer(ffmpegProcess.stderr)
+          const stderrOutput = Buffer.from(stderrBuffer).toString()
           const exitCode = await ffmpegProcess.exited
 
+          if (stderrOutput.length > 0) {
+            console.log('ffmpeg stderr (AVIF):', stderrOutput)
+          }
+
           if (exitCode !== 0) {
-            const stderrOutput = Buffer.concat(stderrChunks).toString()
-            console.error('ffmpeg error:', stderrOutput)
+            console.error('ffmpeg error (AVIF), Exit Code:', exitCode)
             return {
               success: false,
               error: `ffmpeg exited with code ${exitCode}: ${stderrOutput}`,
             }
           }
 
-          // Read the generated file and then clean it up
           const imgBuffer = await fs.promises.readFile(tmpFilePath)
-          await fs.promises.unlink(tmpFilePath)
+
           if (imgBuffer.length > 0) {
             return {
               success: true,
-              data: imgBuffer,
+              data: Buffer.from(imgBuffer),
             }
           }
           else {
             return {
               success: false,
-              error: 'No data received from ffmpeg',
+              error: 'Generated AVIF file is empty',
             }
           }
         }
         else {
-          // For JPEG: output using mjpeg to stdout
           ffmpegArgs.push('-f', 'image2pipe')
           ffmpegArgs.push('-q:v', '3')
           ffmpegArgs.push('-vcodec', 'mjpeg')
           ffmpegArgs.push('-')
 
-          console.log('Running ffmpeg with args:', ffmpegArgs)
+          console.log('Running ffmpeg (JPEG) with args:', ffmpegArgs)
           const ffmpegProcess = spawn({
             cmd: ['ffmpeg', ...ffmpegArgs],
             stdout: 'pipe',
             stderr: 'pipe',
           })
 
-          const stdoutChunks = []
-          const stderrChunks = []
-
-          const stdoutPromise = (async () => {
-            for await (const chunk of ffmpegProcess.stdout) {
-              stdoutChunks.push(chunk)
-            }
-          })()
-
-          const stderrPromise = (async () => {
-            for await (const chunk of ffmpegProcess.stderr) {
-              stderrChunks.push(chunk)
-            }
-          })()
-
-          await Promise.all([stdoutPromise, stderrPromise])
+          const [stdoutBuffer, stderrBuffer] = await Promise.all([
+            readableStreamToArrayBuffer(ffmpegProcess.stdout),
+            readableStreamToArrayBuffer(ffmpegProcess.stderr),
+          ])
           const exitCode = await ffmpegProcess.exited
+          const stderrOutput = Buffer.from(stderrBuffer).toString()
+
+          if (stderrOutput.length > 0) {
+            console.log('ffmpeg stderr (JPEG):', stderrOutput)
+          }
 
           if (exitCode !== 0) {
-            const stderrOutput = Buffer.concat(stderrChunks).toString()
-            console.error('ffmpeg error:', stderrOutput)
+            console.error('ffmpeg error (JPEG), Exit Code:', exitCode)
             return {
               success: false,
               error: `ffmpeg exited with code ${exitCode}: ${stderrOutput}`,
             }
           }
 
-          const imgBuffer = Buffer.concat(stdoutChunks)
+          const imgBuffer = Buffer.from(stdoutBuffer)
           if (imgBuffer.length > 0) {
             return {
               success: true,
@@ -211,25 +245,39 @@ app.get('/generate-thumbnail', async (c) => {
           else {
             return {
               success: false,
-              error: 'No data received from ffmpeg',
+              error: 'No JPEG data received from ffmpeg stdout',
             }
           }
         }
       }
       catch (error) {
-        console.error(error)
+        console.error('Error during thumbnail generation:', error)
+        const errorMessage = error instanceof Error ? error.message : String(error)
         return {
           success: false,
-          error: `Error processing video: ${error.message}`,
+          error: `Error processing video: ${errorMessage}`,
+        }
+      }
+      finally {
+        if (tmpFilePath) {
+          try {
+            await fs.promises.unlink(tmpFilePath)
+          }
+          catch (unlinkError) {
+            console.error(`Failed to delete temp file ${tmpFilePath}:`, unlinkError)
+          }
         }
       }
     })
 
-    if (result?.success) {
-      await uploadThumbnail(cacheKey, result.data)
-      return c.body(result.data, 200, {
+    if (result?.success && result.data && result.data.length > 0) {
+      if (!noCache) {
+        await uploadThumbnail(cacheKey, result.data)
+      }
+      return c.body(result.data.buffer as ArrayBuffer, 200, {
         'content-type': outputMimeType,
         'cache-control': CACHE_CONTROL,
+        'ETag': etag, // Add ETag header
         'Vary': 'Accept',
       })
     }
@@ -238,8 +286,9 @@ app.get('/generate-thumbnail', async (c) => {
     }
   }
   catch (error) {
-    console.error(error)
-    return c.text(`Error processing request: ${error.message}`, 500)
+    console.error('Error handling /generate-thumbnail request:', error)
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    return c.text(`Error processing request: ${errorMessage}`, 500)
   }
 })
 
