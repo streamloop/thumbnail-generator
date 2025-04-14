@@ -87,7 +87,9 @@ app.get('/generate-thumbnail', async (c) => {
         let filter = ''
         if (fit === 'crop') {
           // Use aspect ratio-aware cropping similar to browser implementation
-          filter = `scale=iw*min(${width}/iw\\,${height}/ih):ih*min(${width}/iw\\,${height}/ih),crop=${width}:${height}`
+          // Scale the video so that it covers the target dimensions while preserving aspect ratio
+          // Crop the center of the scaled video to the target dimensions
+          filter = `scale='max(iw*${height}/ih\\, ${width})':'max(ih*${width}/iw\\, ${height})',crop=${width}:${height}`
         }
         else if (fit === 'clip' || fit === 'fill') {
           // Preserve aspect ratio & center in frame (clip/letterbox)
